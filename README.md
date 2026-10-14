@@ -1,2 +1,2 @@
 # Noxis
-Trading Algorirthm 1
+Trading Algorithm 1
