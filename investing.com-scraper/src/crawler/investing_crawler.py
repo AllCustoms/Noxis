@@ -1,0 +1,271 @@
+import json
+import time
+import random
+import datetime as dt
+
+from typing import Any, Optional, Union, Generator, Callable
+from parsel import Selector
+from seleniumbase import Driver
+from selenium.common.exceptions import InvalidSessionIdException, NoSuchWindowException
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+
+from src.settings import settings
+from src.items import Article
+from src.core.logger import Logger
+from src.util.utils import clean_text, to_datetime_aware, path
+from src.util.selector import investing_com as se
+from src.util.date_handler import convert_time_date
+
+driver_exceptions: tuple = (
+    json.JSONDecodeError, InvalidSessionIdException, NoSuchWindowException,
+    KeyError, IndexError, TypeError, AttributeError
+)
+
+
+class InvestingCrawler:
+    logger = Logger("InvestingAPI")
+    sentiment_analyzer = SentimentIntensityAnalyzer()
+
+    def __init__(self, worker_id: Optional[int] = None, proxy: dict = settings["PROXY"]) -> None:
+        self._driver = None
+        self.proxy: dict = proxy
+        self.worker_id = worker_id
+
+        self._crawling_category: str = ''
+        self._format_date: Callable = lambda _date: convert_time_date(
+            ''.join(_date.replace('<!-- --> <!-- -->', ' ').replace(', ', ',').split(' ', 1)[-1].split('<', 1)[0])
+        )
+
+        self.logger.info('InvestingAPI initialized successfully')
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.driver.quit()
+
+    def __del__(self) -> None:
+        self.driver.quit()
+
+    @property
+    def driver(self):
+        """ Returns the seleniumbase uc driver """
+        if self._driver is None or not self._driver.is_connected():
+            self._driver = Driver(
+                uc=True,
+                headless2=True,
+                proxy=self.proxy,
+                browser='chrome',
+                page_load_strategy="eager",
+                dark_mode=True,
+                do_not_track=True,
+                user_data_dir=path(path('..', '.data_dirs'), f'InvestingCrawlerProfile_{self.worker_id or 1}'),
+            )
+            self.logger.debug("crawler started seleniumbase uc driver")
+
+        return self._driver
+
+    def pagination(self, topic: str, starting_page: int) -> Generator[str, None, None]:
+        """
+         generates page's urls for scraping articles
+
+         :param topic: (str) name of topic or category to get the news from
+         :param starting_page: (int) starting page number
+
+         :yield: a page url as a str
+        """
+        categories: dict[str, str] = {
+            "popular": 'news/most-popular-news',
+            "stockmarket": 'news/stock-market-news',
+            "stock_markets_analysis": 'analysis/stock-markets',
+            "market_overview": 'analysis/market-overview',
+            "trading": 'news/insider-trading-news',
+            "commodities": 'news/commodities-news',
+            "forex": 'news/forex-news',
+            "ideas": 'news/investment-ideas',
+            "swot": 'news/swot-analysis',
+            "economics": 'news/economic-indicators',
+            "sec_filings": 'news/sec-filings',
+            "economy": 'news/economy',
+            "world": 'news/world-news',
+            "politics": 'news/politics',
+            "companies": 'news/company-news',
+            "general": 'news/general',
+            "press_releases": 'news/press-releases',
+            "earnings_reports": 'news/insider-trading-news',
+            "cryptocurrencies": 'news/cryptocurrency-news',
+            "bitcoin": 'crypto/bitcoin/news',
+            "ethereum": 'crypto/ethereum/news',
+            "xrp": 'crypto/xrp/news',
+            "cardano": 'crypto/cardano/news',
+            "sol": 'crypto/solana/news',
+            "polkadot": 'crypto/polkadot-new/news',
+            "shiba": 'crypto/shiba-inu/news',
+            "dogecoin": 'crypto/dogecoin/news',
+            "latest": 'news/latest-news',
+        }
+
+        category: str = categories.get(topic, categories["latest"])
+        self._crawling_category: str = category
+
+        while True:
+            yield settings['INVESTING_ENDPOINT'] + f'/{category}/{starting_page}'
+            starting_page += 1
+
+    def crawl_page(self, link: str, stop_date: Optional[dt.datetime] = None) -> Generator[Article, None, None]:
+        self.driver.get(link)
+        time.sleep(0.2)
+
+        try: response: str = self.driver.page_source
+        except AttributeError as e:
+            self.logger.error(f"couldn't scrape articles from Investing-Crawler - error: '{e}'")
+            return
+
+        selector = Selector(text=response, type='html')
+        articles: list = selector.css(se['articles_section'])
+        if len(articles) <= 0:
+            articles: list = selector.css(se['analysis_section'])
+
+        if articles:
+            self.logger.debug(f"found and crawling {len(articles)} article from page_link: {link}")
+
+        found_articles: list[dict[str, Any]] = []
+        for article_html in articles:
+            article_data: dict[str, Any] = {
+                "title": clean_text(article_html.css(se['title']).extract()),
+                "summary": clean_text(article_html.css(se['summary']).extract()),
+                "publisher": clean_text(
+                    [article_html.css(se['publisher_agency']).get() or article_html.css(se['article_writer']).get()]
+                ),
+                "url": article_html.css(se['url']).get()
+            }
+
+            if 'Investing.com Studios' in article_data['publisher'].strip(): continue
+            found_articles.append(article_data)
+
+        random.shuffle(found_articles)  # less bot behavior
+        for found_article in found_articles:
+            article_obj: Union[Article, bool] = self.extract_article(found_article, stop_date)
+            if article_obj: yield article_obj
+
+    def crawl(
+            self,
+            topic_category: str = 'latest',
+            stop_date: Optional[dt.datetime] = None,
+            max_articles: int = 500,
+            starting_page: int = 1,
+    ) -> Generator[Article, None, None]:
+        """
+         extract articles from category page ready for requesting and scraping.
+
+         :param topic_category: (str) name of topic or category to get the news from
+         :param stop_date: (Optional[dt.datetime]) date to stop scraping articles when reached
+         :param max_articles: (int) maximum number of articles to be scraped
+         :param starting_page: (int) a page number to start scraping from
+
+         :yield: Article object
+        """
+        self.logger.debug(f'started scraping category "{topic_category}" for "{max_articles}" articles')
+
+        articles_counter: int = 0
+        for url in self.pagination(topic_category, starting_page):
+            self.logger.debug(f'crawling page number {url.split("/")[-1]}')
+            for article in self.crawl_page(link=url, stop_date=stop_date):
+                yield article
+                articles_counter += 1
+                if articles_counter >= max_articles:
+                    self.logger.info(f'scrapped {articles_counter}/{max_articles} articles from "{topic_category}"')
+                    return
+
+    def extract_article(self, article: dict, stop_date: Optional[dt.datetime] = None) -> Union[Article, bool]:
+        """ extract article data after collecting article url from main category page """
+        self.driver.get(article['url'])
+        time.sleep(0.2)
+
+        try: article_page: str = self.driver.page_source
+        except (AttributeError, TypeError) as e:
+            self.logger.error(f"couldn't scrape article: {article['url']} from Investing-API - error: '{e}'")
+            return False
+
+        return self.parse(
+            item_html=article_page,
+            url=article['url'],
+            title=article['title'],
+            publisher=article['publisher'],
+            summary=article['summary'],
+            stop_date=stop_date,
+        )
+
+    def parse(
+        self,
+        item_html: str,
+        url: str,
+        title: str,
+        publisher: str,
+        summary: str,
+        stop_date: Optional[dt.datetime] = None,
+    ) -> Union[Article, bool]:
+        """ extract article data after collecting article url from main category page """
+        article = Article()
+
+        article['body']: Selector = Selector(text=item_html, type='html')
+
+        dates: list[str] = article['body'].css(se['published_modified_dates']).getall()
+        for date in dates:
+            if 'Published' in date: article['published'] = self._format_date(date)
+            if 'Updated' in date: article['modified'] = self._format_date(date)
+            if article['published'] and article['modified']: break
+
+        # date is already UTC
+        if (
+            isinstance(stop_date, dt.datetime) and
+            isinstance(article["published"], dt.datetime) and
+            article["published"] < to_datetime_aware(stop_date)
+        ):
+            return False
+
+        article['publisher'] = publisher
+        article['title'] = title
+        article['url'] = url
+
+        article['article_type'] = 'news'
+        if self._crawling_category in ["stock_markets_analysis", "market_overview"]:
+            article['article_type'] = 'analysis'
+
+        article['tags'] = ["Investing Article", article['article_type']]
+        try:
+            article['category'] = self._crawling_category.lower().replace('_', ' ').split('/')[1]
+            article['tags'].append(article['category'].capitalize())
+        except IndexError:
+            article['category'] = None
+
+        article['summary'] = summary.replace('-- ', '  ').replace(') -', '  ').split('  ', 1)[-1] or None
+
+        article['images'] = [
+            img for img in article['body'].css(se['images']).getall()
+            if "/" in img and '.' in img and 'http' in img
+        ] or None
+
+        article['icon'] = article['images'][0] if article['images'] else (article['body'].css(se['icon']).get() or None)
+
+        article['authors'] = [clean_text(author) for author in article['body'].css(se['authors']).extract()]
+        if not article['authors']:
+            article['authors'] = article['body'].css(se['authors_2']).extract_first('')
+            if 'By ' in article['authors']:
+                article['authors'] = article['authors'].replace('By ', '').lower()
+            else: article['authors'] = None
+
+        article['body'] = clean_text(
+            ' '.join(article['body'].css(se['content']).extract())
+        )
+
+        article_text: str = (
+                article["title"] + "\n" +
+                article["summary"] + "\n" +
+                article["body"]
+        )
+        sentiment_score: float = self.sentiment_analyzer.polarity_scores(article_text)["compound"]
+
+        article["sentiment_score"] = sentiment_score
+        if sentiment_score > 0.1: article["sentiment"] = "positive"
+        elif sentiment_score < -0.1: article["sentiment"] = "negative"
+        else: article["sentiment"] = "neutral"
+
+        return article
